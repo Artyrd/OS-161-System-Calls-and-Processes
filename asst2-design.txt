@@ -1,0 +1,192 @@
+Group 161 Design Document
+
+Data Structure:
+===================================================================================================
+File Descriptor Table (per-process):
+    - Static array of int.
+    - Added to proc struct, and is thus initialised with each new process.
+    - Contains the index in of_table.of[] for each specified open file, defaults to -1.
+
+        int * fd_table[128] 
+
+    - There is a disadvantage of fd not explicitly directing towards an openfile.
+    - If fork() is called, the system can simply duplicate the fd_table’s array of ints.
+        Since the open file table is global, the contained indexes would refer to the same openfile.
+
+Open File Table (shared between processes):
+    - Struct, containing a static array of pointers to open_file structs and a lock.
+    - Initialised in main.c, and stored in file.h which remains independent of new processes, and thus able to be shared.
+
+    struct of_table {
+         struct open_file *   of[128]        // array of open_file pointers, default to NULL
+         struct lock *        of_table_lock  // lock when modifying table
+    }
+
+    - The index of open_file’s on the of_table cannot be explicitly changed.
+    - Existing open_file entries can only be closed then reopened to a different index.
+    - For the purposes of the basic assignment, where it is assumed that a single process runs on a single thread, 
+        a 128 entry table is simple to implement and is enough to contain 128 possible different FD/opened files.
+        However if multiple processes were able to run simultaneously, a dynamically allocated structure 
+        such as a binary search tree would be more suitable to hold more open_file entries while saving memory.
+
+Open File (shared between processes):
+    - Struct containing all the necessary information of an opened file. 
+    struct open_file {
+        off_t              offset      // file offset
+        struct vnode *     v_ptr       // pointer to vnode
+        int                flag        // (read/write)
+        struct lock *      of_lock     // lock when moving pointer
+        int                ref_counter // free of after nothing references it
+    }
+
+Example: Accessing vnode of a fd
+    fd_table[fd]     = i
+    of_table.of[i]   = *openfile
+    openfile->v_ptr  = *vnode
+
+
+Concurrency Issues:
+===================================================================================================
+Individual Process File Descriptors do not need a lock as:
+    Each process is single-threaded.
+    Each process' FD table is only modified by its own process.
+
+The Open_File Table must be locked when:
+    An open_file entry is created or closed.
+
+An Open_File entry must be locked when:
+    The open_file is used/modified (fp, ref_counter).
+    The open_file is closed.
+
+    - Processes may freely access an open_file entry without worry about its existence/position in the global open_file table.
+    - If 2 or more processes refer to an open_file, there is no worry of process2 closing the open_file 
+        while it is in use by process1, as close() only destroys the open_file when the ref_counter reaches 0, 
+        i.e. the single remaining process that is using an open_file closes it.
+    - Hence read, write, lseek, dup2 does not need to acquire the lock for the global of_table, 
+        and only require locking the specified openfile.
+
+
+Function Designs:
+===================================================================================================
+
+case SYS_open
+===================================================================================================
+int open(const char *filename, int flags, mode_t mode);
+
+sys_open is a wrapper function around any_open().
+sys_open checks the filename specified by the user.
+
+user programs can only open files using sys_open().
+kernel programs can bypass sys_open and directly use any_open().
+
+Implementation:
+    - Create a vnode for the specified file (using vfs_open and passing arguments)
+    - Lock of_table
+    - Find an available slot in of_table
+    - Create an OF entry
+    - Release of_table lock
+    - Insert into the process’ fd_table
+    - Return fd number
+
+
+case SYS_close
+=================================================================
+void close(int fd);
+
+Implementation:
+    - Lock OF_TABLE
+    - Navigate to open_file pointed by current process’ fd_table
+    - Lock OF_ENTRY
+    - If open_file reference count > 1, decrement: 
+        - file->ref_counter += -1
+        - Release Lock OF_ENTRY
+    - Else open_file reference count == 1; free openfile
+        - vfs_close(file->v_ptr)
+        - Release Lock OF_ENTRY
+        - Free lock
+        - Free openfile
+    - Free fd entry
+
+
+case SYS_read
+===================================================================================================
+sys_read(int fd, void *buf, size_t buflen, int *retval);
+
+Implementation:
+    - Check for valid fd
+        - If invalid, return EBADF
+    - Obtain OF table entry
+        - If entry does not return a valid open_file, return EBADF
+    - Check open_file's flag if read is permitted
+    - Obtain vnode of the target open_file
+    - Initialise iov and uio
+    - Fill iov and uio with helper function
+    - VOP_READ(vn, uio)
+    - Change stored offset to reflect new offset
+    - Return number of bytes read
+
+
+case SYS_write
+===================================================================================================
+sys_write(int fd, userptr_t *buf, size_t nbytes, int *retval);
+
+Implementation: (similar to sys_read)
+    - Check for valid fd
+        - If invalid, return EBADF
+    - Obtain OF table entry
+        - If entry does not return a valid open_file, return EBADF
+    - Check open_file's flag if write is permitted
+    - Obtain vnode of the target open_file
+    - Initialise iov and uio
+    - Fill iov and uio with helper function
+    - VOP_WRITE(vn, uio)
+    - Change stored offset to reflect new offset
+    - Return number of bytes written
+
+
+case SYS_lseek
+===================================================================================================
+sys_lseek(int fd, off_t pos, int whence, off_t *retval64);
+
+Pre-processing:
+    - The application passes the pos in two registers a2 and a3, therefore join32to64() must be used to combine them first.
+    - join32to64(tf->tf_a2, tf->tf_a3, &pos);
+    - Whence is stored on the stack and retrieved by copyin().
+    - copyin(tf->tf_sp + 16, &whence, sizeof(int));
+
+Implementation:
+    - Check for valid fd
+        - If invalid, return EBADF
+    - Obtain OF table entry
+        - If entry does not return a valid open_file, return EBADF
+    - Obtain vnode of the target open_file
+    - Case 1: whence == SEEK_SET
+        - set FILE offset to be pos
+    - Case 2: whence == SEEK_CUR
+        - set FILE offset to be current + pos
+    - Case 3: whence == SEEK_END
+        - set FILE offset to be EOF + pos
+    - Return new offset
+
+Post-processing:
+    - The registers cannot contain 64bit values, so the return offset must be split again using split64to32().
+    - split64to32(retval64, &tf->tf_v0, &tf->tf_v1);
+
+
+case SYS_dup2
+===================================================================================================
+int dup2(int oldfd, int newfd)
+
+Implementation:
+    - Check for valid fd (both oldfd and new fd)
+    - Check oldfd refers to a valid open file
+        fd_table[oldfd] = target_of
+    - Case 1: oldfd = newfd
+        Do nothing
+    - Case 2: newfd already has an open file
+        Close newfd’s open file (error check)
+        Proceed to Case 3
+    - Case 3: newfd doesnt refer to anything
+        Make newfd point to oldfd’s open file
+        Increment ref_count of target_of
+    - Return new fd
